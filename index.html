@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Paste → Square Crop → 640×640 (Fixed)</title>
+  <style>
+    :root{--bg:#0f1724;--panel:#0b1220;--accent:#7dd3fc;--muted:#94a3b8}
+    *{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    body{margin:0;min-height:100vh;background:linear-gradient(180deg,#071022 0%, #081228 100%);color:#e6eef8;display:flex;align-items:center;justify-content:center;padding:20px}
+    .app{width:100%;max-width:980px;background:rgba(255,255,255,0.03);border-radius:12px;padding:18px}
+    header{display:flex;align-items:center;gap:12px}
+    h1{font-size:18px;margin:0}
+    p{color:var(--muted);margin:6px 0 12px;font-size:13px}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+    button,input[type=file]{background:transparent;border:1px solid rgba(255,255,255,0.06);color:inherit;padding:8px 10px;border-radius:8px;cursor:pointer}
+    .stage{display:flex;gap:12px}
+    .left{flex:1;display:flex;flex-direction:column;align-items:center;gap:8px}
+    .canvas-wrap{position:relative;border-radius:8px;overflow:hidden;background:#061022;width:640px;height:640px;display:flex;align-items:center;justify-content:center}
+    canvas{display:block}
+    .placeholder{color:var(--muted);text-align:center;padding:24px;position:absolute;pointer-events:none}
+    .overlay-canvas{position:absolute;left:0;top:0;width:640px;height:640px;pointer-events:auto}
+    .controls-bottom{display:flex;gap:8px;margin-top:10px}
+    .preview{width:220px;min-width:220px}
+    .preview img{width:100%;height:auto;border-radius:6px;border:1px solid rgba(255,255,255,0.04);display:block}
+    .info{font-size:13px;color:var(--muted);margin-top:8px}
+    .btn-primary{background:var(--accent);color:#012;border:none}
+    footer{margin-top:12px;font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Paste image → Select square → Export 640×640</h1>
+    </header>
+    <p>Paste (Ctrl/Cmd+V) an image or click "Open". The image is shown in a 640×640 preview. Drag the square to move it or drag the corner handles to resize. Export stretches the selection to 640×640 and downloads it; the app will also try to copy the PNG to your clipboard.</p>
+
+    <div class="controls">
+      <input id="file" type="file" accept="image/*" />
+      <button id="fit">Ensure min side ≥ 640</button>
+      <button id="download" class="btn-primary">Export 640×640 & Copy</button>
+      <button id="reset">Clear</button>
+    </div>
+
+    <div class="stage">
+      <div class="left">
+        <div class="canvas-wrap" id="canvasWrap">
+          <canvas id="imageCanvas" width="640" height="640" aria-label="Image preview"></canvas>
+          <canvas id="overlayCanvas" class="overlay-canvas" width="640" height="640" aria-hidden="false"></canvas>
+          <div class="placeholder" id="placeholder">No image — paste (Ctrl/Cmd+V) an image or open a file.</div>
+        </div>
+        <div class="controls-bottom">
+          <div class="info">Tip: drag inside square to move, drag corner handles to resize. Works with mouse or touch.</div>
+        </div>
+      </div>
+      <div class="preview">
+        <strong>Preview (exported 640×640)</strong>
+        <div style="margin-top:8px"><img id="previewImg" alt="preview" /></div>
+        <div class="info">After export the image will download and be placed on your clipboard if your browser supports it.</div>
+      </div>
+    </div>
+
+    <footer>Works best on secure origins (https or localhost). Clipboard image write requires browser support and permissions.</footer>
+  </div>
+
+<script>
+(() => {
+  const fileInput = document.getElementById('file');
+  const imageCanvas = document.getElementById('imageCanvas');
+  const overlayCanvas = document.getElementById('overlayCanvas');
+  const ctx = imageCanvas.getContext('2d');
+  const octx = overlayCanvas.getContext('2d');
+  const placeholder = document.getElementById('placeholder');
+  const previewImg = document.getElementById('previewImg');
+  const fitBtn = document.getElementById('fit');
+  const downloadBtn = document.getElementById('download');
+  const resetBtn = document.getElementById('reset');
+
+  let originalImage = null; // HTMLImageElement with natural sizes
+  let display = {w:0,h:0,offsetX:0,offsetY:0,scale:1};
+  // selection in display coordinates (pixels inside the 640x640 canvas)
+  let sel = {x:0,y:0,size:0};
+  let dragging=false, resizing=false, activeHandle=null, dragOffset={x:0,y:0};
+  const HANDLE = 12; // visual handle size
+  const MIN_SIZE = 32;
+
+  function showPlaceholder(show){ placeholder.style.display = show ? 'block' : 'none'; }
+
+  function loadImageFromBlob(blob){
+    return new Promise((resolve,reject)=>{
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = ()=>{ URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = (e)=>{ URL.revokeObjectURL(url); reject(new Error('Image load error')); };
+      img.src = url;
+    });
+  }
+
+  async function setOriginalImage(img){
+    originalImage = img;
+    // compute display size to fit whole image inside 640x640
+    const cw = imageCanvas.width, ch = imageCanvas.height;
+    const scale = Math.min(cw / originalImage.naturalWidth, ch / originalImage.naturalHeight);
+    display.scale = scale;
+    display.w = Math.round(originalImage.naturalWidth * scale);
+    display.h = Math.round(originalImage.naturalHeight * scale);
+    display.offsetX = Math.round((cw - display.w)/2);
+    display.offsetY = Math.round((ch - display.h)/2);
+
+    // default selection: centered square occupying 80% of the smaller displayed side
+    const base = Math.min(display.w, display.h);
+    sel.size = Math.max(MIN_SIZE, Math.round(base * 0.8));
+    sel.x = Math.round(display.offsetX + (display.w - sel.size)/2);
+    sel.y = Math.round(display.offsetY + (display.h - sel.size)/2);
+
+    drawAll();
+    showPlaceholder(false);
+    previewImg.removeAttribute('src'); previewImg.style.display='none';
+  }
+
+  function drawAll(){
+    // main image
+    ctx.clearRect(0,0,imageCanvas.width,imageCanvas.height);
+    if(!originalImage) return;
+    ctx.drawImage(originalImage, 0,0, originalImage.naturalWidth, originalImage.naturalHeight,
+                  display.offsetX, display.offsetY, display.w, display.h);
+    drawOverlay();
+  }
+
+  function drawOverlay(){
+    octx.clearRect(0,0,overlayCanvas.width,overlayCanvas.height);
+    if(!originalImage) return;
+    // dim whole
+    octx.fillStyle = 'rgba(0,0,0,0.45)';
+    octx.fillRect(0,0,overlayCanvas.width,overlayCanvas.height);
+    // clear selection area
+    octx.clearRect(sel.x, sel.y, sel.size, sel.size);
+    // border
+    octx.strokeStyle = 'rgba(125,211,252,0.95)'; octx.lineWidth = 2;
+    octx.strokeRect(sel.x+1, sel.y+1, sel.size-2, sel.size-2);
+    // handles
+    const pts = [
+      [sel.x, sel.y],
+      [sel.x + sel.size/2, sel.y],
+      [sel.x + sel.size, sel.y],
+      [sel.x + sel.size, sel.y + sel.size/2],
+      [sel.x + sel.size, sel.y + sel.size],
+      [sel.x + sel.size/2, sel.y + sel.size],
+      [sel.x, sel.y + sel.size],
+      [sel.x, sel.y + sel.size/2]
+    ];
+    octx.fillStyle = '#ffffff';
+    pts.forEach(p=>{
+      octx.fillRect(Math.round(p[0]-HANDLE/2), Math.round(p[1]-HANDLE/2), HANDLE, HANDLE);
+      octx.strokeStyle='rgba(0,0,0,0.6)'; octx.lineWidth=2;
+      octx.strokeRect(Math.round(p[0]-HANDLE/2), Math.round(p[1]-HANDLE/2), HANDLE, HANDLE);
+    });
+  }
+
+  function pointToCanvasLocal(clientX, clientY){
+    const rect = overlayCanvas.getBoundingClientRect();
+    return {x: clientX - rect.left, y: clientY - rect.top};
+  }
+
+  function findHandleAt(x,y){
+    const pts = [
+      ['nw', sel.x, sel.y],
+      ['n', sel.x + sel.size/2, sel.y],
+      ['ne', sel.x + sel.size, sel.y],
+      ['e', sel.x + sel.size, sel.y + sel.size/2],
+      ['se', sel.x + sel.size, sel.y + sel.size],
+      ['s', sel.x + sel.size/2, sel.y + sel.size],
+      ['sw', sel.x, sel.y + sel.size],
+      ['w', sel.x, sel.y + sel.size/2]
+    ];
+    for(const p of pts){
+      const dx = x - p[1], dy = y - p[2];
+      const half = HANDLE/2 + 6; // generous hit area
+      if(Math.abs(dx) <= half && Math.abs(dy) <= half) return p[0];
+    }
+    return null;
+  }
+
+  overlayCanvas.addEventListener('pointerdown', (ev)=>{
+    if(!originalImage) return;
+    overlayCanvas.setPointerCapture(ev.pointerId);
+    const pt = pointToCanvasLocal(ev.clientX, ev.clientY);
+    const h = findHandleAt(pt.x, pt.y);
+    if(h){ resizing = true; activeHandle = h; return; }
+    // check inside selection
+    if(pt.x >= sel.x && pt.x <= sel.x + sel.size && pt.y >= sel.y && pt.y <= sel.y + sel.size){
+      dragging = true; dragOffset.x = pt.x - sel.x; dragOffset.y = pt.y - sel.y; return;
+    }
+  });
+
+  overlayCanvas.addEventListener('pointermove', (ev)=>{
+    if(!(dragging||resizing) || !originalImage) return;
+    const pt = pointToCanvasLocal(ev.clientX, ev.clientY);
+    if(dragging){
+      sel.x = Math.round(pt.x - dragOffset.x); sel.y = Math.round(pt.y - dragOffset.y);
+      clampSelection(); drawAll();
+    } else if(resizing){
+      // compute resize keeping square
+      let newX=sel.x, newY=sel.y, newSize=sel.size;
+      switch(activeHandle){
+        case 'nw':{
+          const ox = sel.x + sel.size, oy = sel.y + sel.size;
+          const dx = Math.abs(pt.x - ox), dy = Math.abs(pt.y - oy);
+          newSize = Math.round(Math.max(dx,dy)); newX = Math.round(ox - newSize); newY = Math.round(oy - newSize);
+        } break;
+        case 'ne':{
+          const ox = sel.x, oy = sel.y + sel.size;
+          const dx = Math.abs(pt.x - ox), dy = Math.abs(pt.y - oy);
+          newSize = Math.round(Math.max(dx,dy)); newX = Math.round(ox); newY = Math.round(oy - newSize);
+        } break;
+        case 'sw':{
+          const ox = sel.x + sel.size, oy = sel.y;
+          const dx = Math.abs(pt.x - ox), dy = Math.abs(pt.y - oy);
+          newSize = Math.round(Math.max(dx,dy)); newX = Math.round(ox - newSize); newY = Math.round(oy);
+        } break;
+        case 'se':{
+          const ox = sel.x, oy = sel.y;
+          const dx = Math.abs(pt.x - ox), dy = Math.abs(pt.y - oy);
+          newSize = Math.round(Math.max(dx,dy)); newX = Math.round(ox); newY = Math.round(oy);
+        } break;
+        case 'n':
+        case 's':
+        case 'e':
+        case 'w':{
+          // symmetric from center
+          const cx = sel.x + sel.size/2, cy = sel.y + sel.size/2;
+          const dist = Math.max(Math.abs(pt.x - cx), Math.abs(pt.y - cy));
+          newSize = Math.round(dist*2); newX = Math.round(cx - newSize/2); newY = Math.round(cy - newSize/2);
+        } break;
+      }
+      if(newSize < MIN_SIZE) newSize = MIN_SIZE;
+      sel.x = newX; sel.y = newY; sel.size = newSize; clampSelection(); drawAll();
+    }
+  });
+
+  overlayCanvas.addEventListener('pointerup', (ev)=>{ dragging=false; resizing=false; activeHandle=null; try{ overlayCanvas.releasePointerCapture(ev.pointerId);}catch(e){} });
+
+  function clampSelection(){
+    // Ensure selection stays inside the displayed image rectangle
+    const minX = display.offsetX, minY = display.offsetY;
+    const maxX = display.offsetX + display.w, maxY = display.offsetY + display.h;
+    if(sel.size > display.w) sel.size = display.w; if(sel.size > display.h) sel.size = display.h;
+    if(sel.x < minX) sel.x = minX; if(sel.y < minY) sel.y = minY;
+    if(sel.x + sel.size > maxX) sel.x = maxX - sel.size; if(sel.y + sel.size > maxY) sel.y = maxY - sel.size;
+    if(sel.size < MIN_SIZE) sel.size = MIN_SIZE;
+  }
+
+  fileInput.addEventListener('change', async (e)=>{
+    const f = e.target.files && e.target.files[0]; if(!f) return;
+    try{
+      const img = await loadImageFromBlob(f);
+      await setOriginalImage(img);
+    }catch(err){ console.error(err); alert('Failed to load image file.'); }
+  });
+
+  window.addEventListener('paste', async (ev)=>{
+    const items = ev.clipboardData && ev.clipboardData.items; if(!items) return;
+    for(const it of items){
+      if(it.type.startsWith('image')){
+        const blob = it.getAsFile();
+        try{ const img = await loadImageFromBlob(blob); await setOriginalImage(img); }catch(err){console.error(err); alert('Could not load pasted image.');}
+        ev.preventDefault(); return;
+      }
+    }
+  });
+
+  // Fit button: resamples original image so its min side >= 640
+  fitBtn.addEventListener('click', async ()=>{
+    if(!originalImage) return;
+    const minSide = Math.min(originalImage.naturalWidth, originalImage.naturalHeight);
+    if(minSide >= 640){ alert('Image already has min side ≥ 640.'); return; }
+    const scale = 640 / minSide;
+    const tmp = document.createElement('canvas'); tmp.width = Math.round(originalImage.naturalWidth * scale); tmp.height = Math.round(originalImage.naturalHeight * scale);
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(originalImage, 0,0, originalImage.naturalWidth, originalImage.naturalHeight, 0,0, tmp.width, tmp.height);
+    tmp.toBlob(async (blob)=>{
+      try{ const img = await loadImageFromBlob(blob); await setOriginalImage(img); }catch(err){ console.error(err); alert('Failed to resample image.'); }
+    }, 'image/png');
+  });
+
+  downloadBtn.addEventListener('click', async ()=>{
+    if(!originalImage) return alert('No image loaded');
+    // compute source rect in original image pixels
+    const srcX = Math.max(0, Math.round((sel.x - display.offsetX) / display.scale));
+    const srcY = Math.max(0, Math.round((sel.y - display.offsetY) / display.scale));
+    const srcSize = Math.max(1, Math.round(sel.size / display.scale));
+    const exportCanvas = document.createElement('canvas'); exportCanvas.width = 640; exportCanvas.height = 640;
+    const ectx = exportCanvas.getContext('2d');
+    try{
+      ectx.drawImage(originalImage, srcX, srcY, srcSize, srcSize, 0,0,640,640);
+    }catch(err){ console.error('drawImage failed', err); alert('Failed to draw image. It may be from a cross-origin source which prevents canvas export. Use a local file or screenshot.'); return; }
+
+    exportCanvas.toBlob(async (blob)=>{
+      if(!blob){ alert('Failed to create PNG'); return; }
+      // download
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'crop-640.png'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      // preview
+      previewImg.src = exportCanvas.toDataURL('image/png'); previewImg.style.display='block';
+      // copy to clipboard if possible
+      try{
+        if(navigator.clipboard && navigator.clipboard.write){ const item = new ClipboardItem({'image/png': blob}); await navigator.clipboard.write([item]); console.log('Copied image to clipboard'); }
+      }catch(err){ console.warn('clipboard write failed', err); }
+    }, 'image/png');
+  });
+
+  resetBtn.addEventListener('click', ()=>{
+    originalImage = null; ctx.clearRect(0,0,imageCanvas.width,imageCanvas.height); octx.clearRect(0,0,overlayCanvas.width,overlayCanvas.height); previewImg.removeAttribute('src'); previewImg.style.display='none'; showPlaceholder(true);
+  });
+
+  // initial UI
+  showPlaceholder(true);
+})();
+</script>
+</body>
+</html>
